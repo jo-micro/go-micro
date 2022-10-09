@@ -31,7 +31,10 @@ require (
 	google.golang.org/protobuf v1.26.0
 )
 
-require github.com/gorilla/websocket v1.4.2
+require (
+	github.com/goneric/stack v0.0.0-20220131052059-5990ae324dbd
+	github.com/gorilla/websocket v1.4.2
+)
 
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20170929234023-d6e3b3328b78 // indirect

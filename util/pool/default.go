@@ -1,11 +1,13 @@
 package pool
 
 import (
+	"errors"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/goneric/stack"
 	"go-micro.dev/v4/transport"
 )
 
@@ -15,7 +17,7 @@ type pool struct {
 	tr   transport.Transport
 
 	sync.Mutex
-	conns map[string][]*poolConn
+	conns map[string]stack.Stack[*poolConn]
 }
 
 type poolConn struct {
@@ -29,25 +31,24 @@ func newPool(options Options) *pool {
 		size:  options.Size,
 		tr:    options.Transport,
 		ttl:   options.TTL,
-		conns: make(map[string][]*poolConn),
+		conns: make(map[string]stack.Stack[*poolConn]),
 	}
 }
 
 func (p *pool) Close() error {
-	p.Lock()
-	defer p.Unlock()
-
 	var err error
 
-	for k, c := range p.conns {
-		for _, conn := range c {
-			if nerr := conn.Client.Close(); nerr != nil {
-				err = nerr
+	p.Lock()
+	for _, conns := range p.conns {
+		for conns.Size() > 0 {
+			if conn, ok := conns.Pop(); ok {
+				if nerr := conn.Client.Close(); nerr != nil {
+					err = nerr
+				}
 			}
 		}
-
-		delete(p.conns, k)
 	}
+	p.Unlock()
 
 	return err
 }
@@ -67,32 +68,45 @@ func (p *poolConn) Created() time.Time {
 
 func (p *pool) Get(addr string, opts ...transport.DialOption) (Conn, error) {
 	p.Lock()
-	conns := p.conns[addr]
+	conns, ok := p.conns[addr]
+	p.Unlock()
+	if !ok {
+		conns = stack.New[*poolConn]()
+	}
 
 	// While we have conns check age and then return one
 	// otherwise we'll create a new conn
-	for len(conns) > 0 {
-		conn := conns[len(conns)-1]
-		conns = conns[:len(conns)-1]
-		p.conns[addr] = conns
+	for conns.Size() > 0 {
+		conn, ok := conns.Pop()
+		if !ok {
+			continue
+		}
+
+		// Push it back in front if this is another connection
+		if conn.Remote() != addr {
+			conns.Push(conn)
+			continue
+		}
 
 		// If conn is old kill it and move on
 		if d := time.Since(conn.Created()); d > p.ttl {
 			if err := conn.Client.Close(); err != nil {
+				p.Lock()
+				p.conns[addr] = conns
 				p.Unlock()
+
 				return nil, err
 			}
 
 			continue
 		}
 
-		// We got a good conn, lets unlock and return it
+		p.Lock()
+		p.conns[addr] = conns
 		p.Unlock()
 
 		return conn, nil
 	}
-
-	p.Unlock()
 
 	// create new conn
 	c, err := p.tr.Dial(addr, opts...)
@@ -108,21 +122,35 @@ func (p *pool) Get(addr string, opts ...transport.DialOption) (Conn, error) {
 }
 
 func (p *pool) Release(conn Conn, err error) error {
-	// don't store the conn if it has errored
-	if err != nil {
-		return conn.(*poolConn).Client.Close()
+	switch c := conn.(type) {
+	case *poolConn:
+		p.Lock()
+		conns, ok := p.conns[conn.Remote()]
+		p.Unlock()
+
+		if !ok {
+			conns = stack.New[*poolConn]()
+		}
+
+		// logger.Tracef("[%s] (%d/%d) conns", c.Remote(), conns.Size(), p.size)
+
+		// don't store the conn if it has errored
+		if err != nil {
+			return c.Client.Close()
+		}
+
+		if conns.Size() >= p.size {
+			return c.Client.Close()
+		}
+
+		conns.Push(c)
+
+		p.Lock()
+		p.conns[conn.Remote()] = conns
+		p.Unlock()
+	default:
+		return errors.New("unknown connection type")
 	}
-
-	// otherwise put it back for reuse
-	p.Lock()
-	defer p.Unlock()
-
-	conns := p.conns[conn.Remote()]
-	if len(conns) >= p.size {
-		return conn.(*poolConn).Client.Close()
-	}
-
-	p.conns[conn.Remote()] = append(conns, conn.(*poolConn))
 
 	return nil
 }
